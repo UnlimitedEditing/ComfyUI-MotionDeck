@@ -1231,6 +1231,9 @@ def compile_deck(manifest, vid_files, img_files, audio_src, out_path, work, inpu
                  width=0, height=0, fps=24, max_frames=2400, style_id=0, pace=1.0):
     W = int(width) or 0
     H = int(height) or 0
+    auto_size = (W, H) == (512, 512)      # Graydient fills 512x512 when no /size is typed: treat as "auto"
+    if auto_size:
+        W = H = 0
     first_speaker = bool(re.search(r"(?i)\bscene\s+speaker\b", manifest or ""))
     if not W and not H:
         W, H = (720, 1280) if first_speaker else (1280, 720)
@@ -1250,6 +1253,21 @@ def compile_deck(manifest, vid_files, img_files, audio_src, out_path, work, inpu
         p = resolve_file(v, input_dir, work)
         if p:
             paths[("i", i)] = p
+    if auto_size and not first_speaker and paths:       # match the first picture's shape
+        try:
+            first = paths.get(("i", 1)) or paths.get(("v", 1)) or paths[sorted(paths)[0]]
+            if first.lower().endswith((".mp4", ".mov", ".mkv", ".webm", ".avi")):
+                w0, h0 = speaker.probe_video(first)
+            else:
+                with Image.open(first) as im0:
+                    w0, h0 = im0.size
+            if w0 >= h0:
+                W, H = 1280, int(round(1280 * h0 / w0))
+            else:
+                W, H = int(round(1280 * w0 / h0)), 1280
+            W, H = max(256, (W // 16) * 16), max(256, (H // 16) * 16)
+        except Exception:
+            pass
     n_img = sum(1 for k in paths if k[0] == "i")
     n_vid = sum(1 for k in paths if k[0] == "v")
     scenes, pnotes = parse_manifest(manifest, max([k[1] for k in paths if k[0] == "i"] or [0]),
