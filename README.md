@@ -21,3 +21,20 @@ four-panel reveal scenes from whatever media is attached.
 ## Inputs
 `width`/`height` (0 = 1280x720, snapped to 16), `fps`, `max_frames`, `style` 0-3, `pace` 0.5-2, optional audio.
 Measured offline: ~39 ms/frame at 1280x720 (about real time), so keep `max_frames` <= 1800 on the 180 s budget.
+
+## Speaker scenes (interview -> vertical, word captions)
+
+    scene speaker v1 hold 60 caps karaoke font 1 size 6 hl yellow title: Hook line
+
+Transcribes the clip with word timing (faster-whisper, audio passed as an array), finds faces (OpenCV YuNet, Haar
+fallback), tracks up to 3 people by x position and picks the speaker per word from mouth-region motion while that
+word is spoken, with a 1.4 s minimum dwell. Output is a hard-cut crop to the speaker (default 720x1280). The source
+audio is kept (and any `audio_file` bed is ducked under it).
+
+Options: `start N`, `hold N`, `stack` (both speakers, one above the other), `fixed N` (lock onto person N),
+`lang xx`, `whisper <model>`; captions `caps karaoke|single|off`, `font 0-3` (DejaVu, Anton, Bebas, Poppins),
+`size N` (% of frame height), `words N`, `capspos N`, `hl`/`fg` colour, `stroke N`, `case upper|lower|normal`.
+
+Clean-room implementation: no code from ClipsKitty (AGPL-3.0). Fonts Anton, Bebas Neue and Poppins are SIL OFL.
+Model files expected under `models/`: `whisper/large-v3/*` and `yunet/face_detection_yunet_2023mar.onnx` (both are
+also fetched at run time if missing).

@@ -8,10 +8,16 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import urllib.request
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from . import speaker
+except ImportError:    # loaded outside a package (offline tests)
+    import speaker
 
 UA = {"User-Agent": "Mozilla/5.0 (MotionDeck)"}
 IMG_HOLD = 2.5       # default seconds a still panel / scene is held
@@ -69,6 +75,12 @@ class Scene:
         self.cols = None
         self.title = ""
         self.sub = ""
+        self.start = 0.0          # speaker scenes: seconds into the source
+        self.fixed = None         # speaker scenes: lock to person N (1 = leftmost)
+        self.stack = False
+        self.lang = ""
+        self.whisper = None
+        self.caps = {}
 
 
 def _num(tok):
@@ -109,12 +121,12 @@ def parse_manifest(text, n_images, n_videos):
             m = re.fullmatch(r"([iv])([1-8])", t)
             if m:
                 sc.media.append((m.group(1), int(m.group(2))))
-            elif t in ("grid", "split", "single", "card"):
+            elif t in ("grid", "split", "single", "card", "speaker"):
                 sc.layout = t
             elif t in ("reveal", "static"):
                 sc.mode = t
             elif t == "hold" and nxt is not None:
-                sc.hold = max(0.5, min(30.0, nxt))
+                sc.hold = max(0.5, min(300.0, nxt))
                 i += 1
             elif t == "cols" and nxt is not None:
                 sc.cols = max(1, min(4, int(nxt)))
@@ -126,6 +138,32 @@ def parse_manifest(text, n_images, n_videos):
                     i += 1
             elif t in ("push", "pull", "panleft", "panright", "drift"):
                 sc.cam = t
+            elif t == "start" and nxt is not None:
+                sc.start = max(0.0, nxt)
+                i += 1
+            elif t == "fixed" and nxt is not None:
+                sc.fixed = max(1, int(nxt))
+                i += 1
+            elif t == "stack":
+                sc.stack = True
+            elif t == "caps" and i + 1 < len(low) and low[i + 1] in ("karaoke", "single", "off"):
+                sc.caps["caps"] = low[i + 1]
+                i += 1
+            elif t in ("font", "size", "words", "capspos", "stroke") and nxt is not None:
+                sc.caps[t] = nxt
+                i += 1
+            elif t in ("hl", "fg") and i + 1 < len(low) and low[i + 1] in speaker.COLORS:
+                sc.caps[t] = low[i + 1]
+                i += 1
+            elif t == "case" and i + 1 < len(low) and low[i + 1] in ("upper", "lower", "normal"):
+                sc.caps["case"] = low[i + 1]
+                i += 1
+            elif t == "lang" and i + 1 < len(low):
+                sc.lang = low[i + 1]
+                i += 1
+            elif t == "whisper" and i + 1 < len(low):
+                sc.whisper = low[i + 1]
+                i += 1
             else:
                 notes.append(f"ignored word '{toks[i]}'")
             i += 1
@@ -143,6 +181,8 @@ def parse_manifest(text, n_images, n_videos):
             sc.media = sc.media[:1]
         if sc.layout == "split":
             sc.media = sc.media[:2]
+        if sc.layout == "speaker":
+            sc.media = sc.media[:1]
         if sc.mode is None:
             sc.mode = "reveal" if (sc.layout == "grid" and len(sc.media) > 1) else "static"
         sc.media = sc.media[:9]
@@ -173,7 +213,7 @@ def _wrap(draw, text, font, max_w):
     return lines
 
 
-def text_layer(title, sub, W, H, style, card=False):
+def text_layer(title, sub, W, H, style, card=False, top=False):
     """RGBA full-frame layer with the title (and subtitle), centred (card) or lower-third (over media)."""
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
@@ -183,7 +223,7 @@ def text_layer(title, sub, W, H, style, card=False):
     tl = _wrap(d, title, tf, int(W * 0.84)) if title else []
     sl = _wrap(d, sub, sf, int(W * 0.8)) if sub else []
     th = int(tsize * 1.2) * len(tl) + (int(ssize * 1.4) * len(sl) + int(ssize * 0.6) if sl else 0)
-    y = (H - th) // 2 if card else int(H * 0.82) - th
+    y = (H - th) // 2 if card else (int(H * 0.09) if top else int(H * 0.82) - th)
     if not card and tl:    # soft band behind the text so it reads over any picture
         band = Image.new("RGBA", (W, th + int(tsize * 0.8)), (0, 0, 0, 120))
         layer.alpha_composite(band, (0, max(0, y - int(tsize * 0.4))))
@@ -482,6 +522,127 @@ class SceneRender:
                 po.reader.close()
 
 
+class SpeakerScene:
+    """Landscape clip with 1-3 people -> vertical (or any aspect) crop that cuts to whoever is talking,
+    with word-by-word captions. Analysis (whisper words, faces, speaker choice) runs in __init__."""
+    kind = "speaker"
+    _title = SceneRender._title
+
+    def __init__(self, sc, path, W, H, fps, style, work):
+        self.sc, self.W, self.H, self.fps, self.style = sc, W, H, fps, style
+        self.panels = [path]
+        self.notes = []
+        t0 = time.time()
+        total = probe_duration(path) or 1.0
+        start = min(sc.start, max(0.0, total - 1.0))
+        self.start = start
+        self.duration = max(1.0, min(sc.hold or 90.0, total - start))
+        self.audio = (path, start, self.duration) if speaker.has_audio(path) else None
+        words = []
+        samples = speaker.decode_wav16k(path, start, self.duration, work) if self.audio else None
+        if samples is not None and len(samples) > 8000:
+            try:
+                words = speaker.transcribe_words(samples, sc.lang, sc.whisper)
+            except Exception as e:     # keep the video even when ASR is unavailable
+                self.notes.append(f"transcription failed: {type(e).__name__}: {e}"[:200])
+        else:
+            self.notes.append("no speech audio found")
+        t_asr = time.time()
+        try:
+            times, frames, size = speaker.sample_faces(path, start, self.duration)
+            self.tracks = speaker.build_tracks(times, frames, size)
+        except Exception as e:
+            self.tracks = {"K": 0, "x": np.zeros((0, 0)), "act": np.zeros((0, 0)), "times": np.zeros(0)}
+            self.notes.append(f"face tracking failed: {type(e).__name__}: {e}"[:200])
+        K = self.tracks["K"]
+        if K == 0:
+            self.notes.append("no faces found: centred crop")
+        fixed = None if sc.fixed is None else sc.fixed - 1
+        self.segs = speaker.decide_speakers(words, self.tracks, self.duration, fixed=fixed)
+        self.stack = bool(sc.stack and K >= 2)
+        self.words = words
+        opts = dict(sc.caps)
+        self.caps = None if opts.get("caps") == "off" else speaker.Captions(words, W, H, opts)
+        # source decode size (long side <= 1920)
+        sw, sh = speaker.probe_video(path)
+        k = min(1.0, 1920.0 / max(sw, sh))
+        self.sw, self.sh = max(2, int(sw * k) // 2 * 2), max(2, int(sh * k) // 2 * 2)
+        self.path = path
+        self.reader = None
+        self.last = None
+        hh = H / 2.0 if self.stack else float(H)
+        asp = W / hh
+        if self.sw / self.sh >= asp:
+            self.ch, self.cw = float(self.sh), self.sh * asp
+        else:
+            self.cw, self.ch = float(self.sw), self.sw / asp
+        self.layer = text_layer(sc.title, sc.sub, W, H, style, top=True) if (sc.title or sc.sub) else None
+        self.title_dur = min(3.0, self.duration - 0.3) if self.layer else 0.0
+        self.info = {"words": len(words), "people": K, "stack": self.stack,
+                     "speaker_segments": [(round(a, 2), round(b, 2), s + 1) for a, b, s in self.segs][:40],
+                     "asr_seconds": round(t_asr - t0, 1), "analysis_seconds": round(time.time() - t0, 1)}
+
+    def n_frames(self):
+        return max(2, int(round(self.duration * self.fps)))
+
+    def _read(self):
+        if self.reader is None:
+            self.reader = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-ss", f"{self.start:.3f}", "-t", f"{self.duration + 0.5:.3f}", "-i", self.path,
+                 "-vf", f"fps={self.fps},scale={self.sw}:{self.sh}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        n = self.sw * self.sh * 3
+        buf = self.reader.stdout.read(n)
+        if len(buf) == n:
+            self.last = Image.frombytes("RGB", (self.sw, self.sh), buf)
+        return self.last or Image.new("RGB", (self.sw, self.sh), (0, 0, 0))
+
+    def _cx(self, ident, t):
+        tr = self.tracks
+        if tr["K"] == 0 or ident >= tr["K"]:
+            return 0.5 * self.sw
+        return float(np.interp(t, tr["times"], tr["x"][ident])) * self.sw
+
+    def _box(self, cx):
+        x0 = min(max(cx - self.cw / 2, 0.0), self.sw - self.cw)
+        y0 = (self.sh - self.ch) / 2
+        return (x0, y0, x0 + self.cw, y0 + self.ch)
+
+    def frame(self, k):
+        t = k / self.fps
+        src = self._read()
+        ident = self.segs[-1][2]
+        for a, b, s in self.segs:
+            if a <= t < b:
+                ident = s
+                break
+        if self.stack:
+            half = self.H // 2
+            img = Image.new("RGB", (self.W, self.H))
+            order = sorted(range(self.tracks["K"]), key=lambda i: self._cx(i, t))[:2]
+            for row, who in enumerate(order):
+                part = src.resize((self.W, half), Image.BILINEAR, box=self._box(self._cx(who, t)))
+                img.paste(part, (0, row * half))
+                if who == ident:
+                    img.paste(Image.new("RGB", (10, half), self.style["accent"]), (0, row * half))
+        else:
+            img = src.resize((self.W, self.H), Image.BILINEAR, box=self._box(self._cx(ident, t)))
+        if self.caps is not None:
+            self.caps.draw(img, t)
+        if self.layer is not None:
+            self._title(img, t, self.title_dur + 0.3)
+        return img
+
+    def close(self):
+        if self.reader is not None:
+            try:
+                self.reader.stdout.close()
+                self.reader.kill()
+            except Exception:
+                pass
+            self.reader = None
+
+
 # ── transitions ───────────────────────────────────────────────────────────────
 
 def blend(a, b, p, kind):
@@ -502,14 +663,49 @@ def blend(a, b, p, kind):
     return Image.blend(a, b, p)
 
 
+def mux_audio(silent, out_path, parts, bed, secs, work):
+    """Lay each speaker scene's source audio at its start in the timeline, add the optional bed
+    (ducked under speech), fade the end, and copy the picture stream untouched."""
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", silent]
+    fl, labels, n = [], [], 1
+    for (src, start, dur), off in parts:
+        cmd += ["-i", src]
+        ms = int(off * 1000)
+        fl.append(f"[{n}:a]atrim=start={start:.3f}:duration={dur:.3f},asetpts=PTS-STARTPTS,aresample=44100,"
+                  f"aformat=channel_layouts=stereo,adelay={ms}|{ms}[p{n}]")
+        labels.append(f"[p{n}]")
+        n += 1
+    if bed:
+        cmd += ["-i", bed]
+        fl.append(f"[{n}:a]aresample=44100,aformat=channel_layouts=stereo,volume={0.25 if parts else 1.0}[p{n}]")
+        labels.append(f"[p{n}]")
+    m = len(labels)
+    fade = 1.5 if (bed and not parts) else 0.25
+    tail = f"[am]afade=t=out:st={max(0.0, secs - fade):.2f}:d={fade},atrim=duration={secs:.3f}[aout]"
+    last = None
+    for norm in (":normalize=0", ""):      # older ffmpeg builds lack amix normalize
+        if m > 1:
+            mix = f"{''.join(labels)}amix=inputs={m}{norm}:duration=longest" + ("" if norm else f",volume={m}") + "[am]"
+        else:
+            mix = f"{labels[0]}anull[am]"
+        full = cmd + ["-filter_complex", ";".join(fl + [mix, tail]), "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy",
+                      "-c:a", "aac", "-b:a", "160k", "-t", f"{secs:.3f}", "-movflags", "+faststart", out_path]
+        last = subprocess.run(full, capture_output=True, text=True)
+        if last.returncode == 0 or m == 1:
+            break
+    if last.returncode:
+        raise RuntimeError("audio mux failed: " + last.stderr[-500:])
+
+
 # ── compile ───────────────────────────────────────────────────────────────────
 
 def compile_deck(manifest, vid_files, img_files, audio_src, out_path, work, input_dir,
                  width=0, height=0, fps=24, max_frames=2400, style_id=0, pace=1.0):
     W = int(width) or 0
     H = int(height) or 0
+    first_speaker = bool(re.search(r"(?i)\bscene\s+speaker\b", manifest or ""))
     if not W and not H:
-        W, H = 1280, 720
+        W, H = (720, 1280) if first_speaker else (1280, 720)
     elif not W:
         W = int(round(H * 16 / 9))
     elif not H:
@@ -540,7 +736,14 @@ def compile_deck(manifest, vid_files, img_files, audio_src, out_path, work, inpu
     renders = []
     try:
         for sc in scenes:
-            renders.append(SceneRender(sc, paths, W, H, fps, style, pace))
+            vp = next((paths[m] for m in sc.media if m[0] == "v" and m in paths), None)
+            if sc.layout == "speaker" and vp:
+                renders.append(SpeakerScene(sc, vp, W, H, fps, style, work))
+            else:
+                if sc.layout == "speaker":
+                    sc.layout = "card"
+                    notes.append("speaker scene needs a video (v1..v8)")
+                renders.append(SceneRender(sc, paths, W, H, fps, style, pace))
         # timeline offsets: scene i starts when the previous ends minus the transition overlap
         offs, ovs, g = [], [], 0
         for i, r in enumerate(renders):
@@ -558,15 +761,9 @@ def compile_deck(manifest, vid_files, img_files, audio_src, out_path, work, inpu
         cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
                "-r", str(fps), "-i", "-"]
         audio = resolve_file(audio_src, input_dir, work) if audio_src else None
-        if audio:
-            cmd += ["-i", audio]
-        cmd += ["-map", "0:v:0"]
-        if audio:
-            secs = total / fps
-            cmd += ["-map", "1:a:0", "-af", f"afade=t=out:st={max(0.0, secs - 1.5):.2f}:d=1.5", "-c:a", "aac",
-                    "-b:a", "160k", "-t", f"{secs:.3f}"]
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart", out_path]
+        silent = os.path.join(work, "silent.mp4")
+        cmd += ["-map", "0:v:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", silent]
         logf = open(os.path.join(work, "ffmpeg_out.log"), "wb")
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=logf)
         try:
@@ -591,11 +788,18 @@ def compile_deck(manifest, vid_files, img_files, audio_src, out_path, work, inpu
         logf.close()
         if rc:
             raise RuntimeError("ffmpeg failed: " + open(os.path.join(work, "ffmpeg_out.log")).read()[-600:])
+        parts = [(r.audio, offs[i] / fps) for i, r in enumerate(renders) if getattr(r, "audio", None)]
+        if parts or audio:
+            mux_audio(silent, out_path, parts, audio, total / fps, work)
+        else:
+            shutil.move(silent, out_path)
     finally:
         for r in renders:
             r.close()
     return {"size": f"{W}x{H}", "fps": fps, "frames": total, "seconds": round(total / fps, 2),
-            "scenes": [{"layout": r.sc.layout, "mode": r.sc.mode, "panels": len(r.panels),
-                        "seconds": round(r.duration, 2), "title": r.sc.title[:60]} for r in renders],
+            "scenes": [dict({"layout": r.sc.layout, "mode": r.sc.mode, "panels": len(r.panels),
+                             "seconds": round(r.duration, 2), "title": r.sc.title[:60]},
+                            **(getattr(r, "info", None) or {}), **({"notes": r.notes} if getattr(r, "notes", None) else {}))
+                       for r in renders],
             "images": n_img, "videos": n_vid, "notes": notes,
             "mb": round(os.path.getsize(out_path) / 1048576, 2)}
