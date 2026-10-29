@@ -28,6 +28,7 @@ WIDE_HOLD = 0.7
 FADE_DEFAULT = 0.5
 TRANS = ("fade", "cut", "slide", "wipe", "slideup", "slidedown", "dip", "flash", "iris", "zoomthru", "blurfade")
 CAMS = ("push", "pull", "panleft", "panright", "drift")
+MIX = ("fade", "slideup", "iris", "zoomthru", "blurfade", "slide", "dip", "wipe")
 ANIMS = ["rise", "pop", "slide", "type", "wipe", "zoom", "drop", "blur"]
 
 STYLES = [   # bg, gutter/border, title fill, title stroke, accent
@@ -91,6 +92,11 @@ class Scene:
         self.lead = 0.12          # voiceover: seconds a transition starts before its cue word
         self.cues = []            # voiceover scenes: list of cue Scenes
         self.cue_words, self.cue_at, self.until = [], None, []
+        self.trans_auto = True    # True until a transition word is given (mix then varies it)
+        self.mix = False          # vary transitions slide by slide
+        self.label_titles = False # voiceover labels: show each label as its title
+        self.label = ""
+        self.deck_default = False # built from the media alone (no manifest)
 
 
 def _num(tok):
@@ -122,9 +128,15 @@ def _apply_tokens(sc, head, notes):
             i += 1
         elif t in TRANS:
             sc.trans = t
+            sc.trans_auto = False
             if nxt is not None:
                 sc.trans_dur = max(0.1, min(3.0, nxt))
                 i += 1
+        elif t == "mix":
+            sc.mix = True
+        elif t == "titles" and i + 1 < len(low) and low[i + 1] in ("on", "off"):
+            sc.label_titles = low[i + 1] == "on"
+            i += 1
         elif t in CAMS:
             sc.cam = t
             sc.cam_auto = False
@@ -207,10 +219,19 @@ def _parse_cue(chunk, notes):
     return sc
 
 
+def _apply_mix(slides):
+    """mix: vary the transition into each slide (unless one was named)."""
+    for k, c in enumerate(slides):
+        if k > 0 and c.mix and c.trans_auto:
+            c.trans = MIX[(k - 1) % len(MIX)]
+
+
 def _parse_reel(head, title, sub, notes):
-    """reel i1 3 push i2 2.5 drift slideup 0.6 v1 6 cut ...: each media token starts its own slide;
-    a bare number is its seconds, then camera / transition [seconds] / anim words."""
+    """reel [N] [mix] [camera] [transition [s]] [anim X] i1 3 push i2 2.5 drift slideup 0.6 v1 6 cut ...:
+    each media token starts its own slide; a bare number is its seconds, then camera / transition [seconds]
+    / anim words. Words before the first media set the defaults for every slide."""
     low = [t.lower() for t in head.replace(",", " ").split()][1:]
+    base = Scene()
     slides, cur, i = [], None, 0
     while i < len(low):
         t = low[i]
@@ -221,27 +242,85 @@ def _parse_reel(head, title, sub, notes):
             cur = Scene()
             cur.layout = "single"
             cur.media = [(m.group(1), int(m.group(2)))]
+            cur.hold, cur.trans, cur.trans_dur, cur.trans_auto = base.hold, base.trans, base.trans_dur, base.trans_auto
+            cur.cam, cur.cam_auto, cur.anim, cur.mix = base.cam, base.cam_auto, base.anim, base.mix
             slides.append(cur)
-        elif cur is None:
-            notes.append(f"ignored word '{t}' before the first media in reel")
         elif num:
-            cur.hold = _clamp_hold(float(num.group(1)))
+            (cur or base).hold = _clamp_hold(float(num.group(1)))
+        elif t == "mix":
+            (cur or base).mix = True
         elif t in TRANS:
-            cur.trans = t
+            tgt = cur or base
+            tgt.trans = t
+            tgt.trans_auto = False
             if nxt is not None:
-                cur.trans_dur = max(0.1, min(3.0, nxt))
+                tgt.trans_dur = max(0.1, min(3.0, nxt))
                 i += 1
         elif t in CAMS:
-            cur.cam = t
-            cur.cam_auto = False
+            tgt = cur or base
+            tgt.cam = t
+            tgt.cam_auto = False
         elif t == "anim" and i + 1 < len(low) and low[i + 1] in ANIMS + ["cycle"]:
-            cur.anim = low[i + 1]
+            (cur or base).anim = low[i + 1]
             i += 1
         else:
             notes.append(f"ignored word '{t}' in reel")
         i += 1
     if slides:
         slides[0].title, slides[0].sub = title, sub
+    _apply_mix(slides)
+    return slides
+
+
+def _parse_label(chunk, notes):
+    """label i1 old lighthouse [camera] [transition [s]] [anim X] [title: ...]: show i1 when 'old lighthouse'
+    is spoken (a cue with the media named first and the spoken words after it)."""
+    fields = list(re.finditer(r"(?i)\b(title|sub)\s*:", chunk))
+    head = chunk[:fields[0].start()] if fields else chunk
+    sc = Scene()
+    sc.layout = "single"
+    for k, m in enumerate(fields):
+        end = fields[k + 1].start() if k + 1 < len(fields) else len(chunk)
+        val = chunk[m.end():end].strip()
+        if m.group(1).lower() == "title":
+            sc.title = val
+        else:
+            sc.sub = val
+    toks = head.replace(",", " ").split()
+    if not toks or not re.fullmatch(r"(?i)[iv][1-8]", toks[0]):
+        notes.append(f"label '{head.strip()[:30]}' must start with a media name like i1 or v2")
+        sc.layout = "card"
+        return sc
+    sc.media = [(toks[0][0].lower(), int(toks[0][1]))]
+    stop = set(("anim", "hold", "for", "lead", "mix", "titles") + TRANS + CAMS)
+    k = 1
+    words = []
+    while k < len(toks) and toks[k].lower() not in stop and not re.fullmatch(r"(?i)[iv][1-8]", toks[k]):
+        words.append(toks[k])
+        k += 1
+    sc.cue_words = re.sub(r"[^\w\s']", " ", " ".join(words).lower()).split()
+    sc.label = " ".join(words)
+    if not sc.cue_words:
+        notes.append(f"label {toks[0]} has no words to listen for")
+    _apply_tokens(sc, " ".join(toks[k:]), notes)
+    return sc
+
+
+def _default_deck(n_images, n_videos, opts):
+    """No manifest: every supplied picture / clip becomes a slide with a transition into it."""
+    media = [("i", i) for i in range(1, n_images + 1)] + [("v", i) for i in range(1, n_videos + 1)]
+    slides = []
+    for k, m in enumerate(media):
+        c = Scene()
+        c.layout = "single"
+        c.media = [m]
+        c.hold, c.trans, c.trans_dur, c.trans_auto = opts.hold, opts.trans, opts.trans_dur, opts.trans_auto
+        c.cam, c.cam_auto, c.anim, c.mix = opts.cam, opts.cam_auto, opts.anim, opts.mix
+        c.deck_default = True
+        if c.cam_auto:
+            c.cam = CAMS[k % len(CAMS)]
+        slides.append(c)
+    _apply_mix(slides)
     return slides
 
 
@@ -261,12 +340,14 @@ def _same_word(a, b):
     return k >= 4 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.84
 
 
-def _find_phrase(words, phrase, pos):
+def _find_phrase(words, phrase, pos, used=()):
     ph = [_norm_word(w) for w in phrase if _norm_word(w)]
     if not ph:
         return None
     ws = [_norm_word(w["word"]) for w in words]
     for j in range(max(0, pos), len(ws) - len(ph) + 1):
+        if any((j + k) in used for k in range(len(ph))):
+            continue
         if all(_same_word(ws[j + k], ph[k]) for k in range(len(ph))):
             return j
     return None
@@ -294,7 +375,7 @@ def expand_voiceover(sc, audio_src, input_dir, work, fps, notes):
             words = speaker.transcribe_words(samples, sc.lang, sc.whisper) if samples is not None else []
         except Exception as e:
             notes.append(f"voiceover transcription failed: {type(e).__name__}: {e}")
-    entries, report, pos, prev = [], [], 0, 0.0
+    entries, report, pos, prev, used, rmap = [], [], 0, 0.0, set(), {}
     for n, c in enumerate(cues):
         label = " ".join(c.cue_words) or (f"at {c.cue_at:g}" if c.cue_at is not None else "?")
         if c.cue_at is not None:
@@ -302,7 +383,11 @@ def expand_voiceover(sc, audio_src, input_dir, work, fps, notes):
             pos = next((j for j, w in enumerate(words) if w["start"] >= t), pos)
             how = "time"
         elif c.cue_words and words:
-            j = _find_phrase(words, c.cue_words, pos)
+            j = _find_phrase(words, c.cue_words, pos, used)
+            how = "heard"
+            if j is None:                      # said earlier than the order it was listed in
+                j = _find_phrase(words, c.cue_words, 0, used)
+                how = "heard (earlier than listed)"
             if j is None:
                 t = prev + max(1.0, (dur - prev) / max(1, len(cues) - n))
                 heard = " ".join(w["word"] for w in words)[:260]
@@ -310,20 +395,34 @@ def expand_voiceover(sc, audio_src, input_dir, work, fps, notes):
                 how = "not heard"
             else:
                 t = float(words[j]["start"])
-                pos = j + len(c.cue_words)
-                how = "heard"
+                used.update(range(j, j + len(c.cue_words)))
+                if how == "heard":
+                    pos = j + len(c.cue_words)
         else:
             t = dur * n / len(cues)
             how = "even"
-        if entries:
-            t = max(t, prev + 0.4)
         t = min(t, max(0.0, dur - 0.4))
+        if c.label_titles and c.label and not c.title:
+            c.title = c.label[:1].upper() + c.label[1:]
         entries.append([t, c])
-        report.append({"cue": label, "at": round(t, 2), "how": how, "show": " ".join(f"{k}{i}" for k, i in c.media)})
+        rep_entry = {"cue": label, "at": round(t, 2), "how": how, "show": " ".join(f"{k}{i}" for k, i in c.media)}
+        report.append(rep_entry)
+        rmap[id(c)] = rep_entry
         prev = t
-    entries[0][0] = 0.0     # the first visual is up from the start
+    entries.sort(key=lambda e: e[0])
+    for k in range(1, len(entries)):
+        entries[k][0] = max(entries[k][0], entries[k - 1][0] + 0.4)
+    opener = None
+    if entries[0][1].cue_at is None and entries[0][0] > 0.8:
+        opener = Scene()           # nothing is shown until the first picture's word is spoken
+        opener.layout = "card"
+        opener.trans, opener.trans_dur = "cut", 0.1
+    else:
+        entries[0][0] = 0.0     # the first visual is up from the start
+    for t_, c_ in entries:
+        rmap[id(c_)]['at'] = round(t_, 2)
     # 'until <word>': the slide ends at that word and a plain card fills the gap to the next cue
-    full = []
+    full = [[0.0, opener]] if opener else []
     for n, (t, c) in enumerate(entries):
         full.append([t, c])
         if c.until and words:
@@ -345,7 +444,10 @@ def expand_voiceover(sc, audio_src, input_dir, work, fps, notes):
         o = 0 if c.trans == "cut" else int(round((c.trans_dur or FADE_DEFAULT) * fps))
         ov.append(max(0, min(o, (F[i] - F[i - 1]) // 2)))
     slides = []
+    mix = sc.mix or any(c.mix for _, c in full)
     for i, (t, c) in enumerate(full):
+        if mix and c.trans_auto and i > 0 and c.layout != "card":
+            c.trans = MIX[(i - 1) % len(MIX)]
         n_i = F[i + 1] - F[i] + (ov[i + 1] if i + 1 < len(full) else 0)
         c.hold = max(2, n_i) / fps
         if c.cam_auto:
@@ -356,6 +458,10 @@ def expand_voiceover(sc, audio_src, input_dir, work, fps, notes):
             c.trans = "cut"
         slides.append(c)
     return slides, ((path, 0.0, total) if path else None), report
+
+
+def kind_has_label(cue_chunks):
+    return any(k.lower() == "label" for k, _ in cue_chunks)
 
 
 def parse_manifest(text, n_images, n_videos):
@@ -370,8 +476,8 @@ def parse_manifest(text, n_images, n_videos):
     else:
         chunks = []
     for ch in chunks:
-        pieces = re.split(r"(?i)\bcue\b", ch)
-        ch, cue_chunks = pieces[0], pieces[1:]
+        pieces = re.split(r"(?i)\b(cue|label)\b", ch)
+        ch, cue_chunks = pieces[0], list(zip(pieces[1::2], pieces[2::2]))
         fields = list(re.finditer(r"(?i)\b(title|sub)\s*:", ch))
         head = ch[:fields[0].start()] if fields else ch
         sc = Scene()
@@ -388,14 +494,19 @@ def parse_manifest(text, n_images, n_videos):
         _apply_tokens(sc, head, notes)
         if cue_chunks:
             sc.layout = "voiceover"
-            sc.cues = [_parse_cue(c, notes) for c in cue_chunks]
+            sc.cues = [(_parse_label if kind.lower() == "label" else _parse_cue)(c, notes) for kind, c in cue_chunks]
+            any_titles = sc.label_titles or any(c.label_titles for c in sc.cues)
+            for c in sc.cues:
+                c.mix = c.mix or sc.mix
+                c.label_titles = any_titles
+                if kind_has_label(cue_chunks) and sc.trans_auto:
+                    c.mix = True
         scenes.append(sc)
-    if not scenes:    # no manifest: groups of 4 as grid-reveal scenes
-        media = [("i", i) for i in range(1, n_images + 1)] + [("v", i) for i in range(1, n_videos + 1)]
-        for k in range(0, len(media), 4):
-            sc = Scene()
-            sc.media = media[k:k + 4]
-            scenes.append(sc)
+    if len(scenes) == 1 and scenes[0].layout is None and not scenes[0].media and not scenes[0].cues \
+            and not scenes[0].title and not scenes[0].sub:
+        scenes = _default_deck(n_images, n_videos, scenes[0])     # only options were written: 'iris 1.5'
+    elif not scenes:
+        scenes = _default_deck(n_images, n_videos, Scene())
     for k, sc in enumerate(scenes):
         if sc.anim == "cycle":
             sc.anim = ANIMS[k % len(ANIMS)]
@@ -1141,11 +1252,18 @@ def compile_deck(manifest, vid_files, img_files, audio_src, out_path, work, inpu
             paths[("i", i)] = p
     n_img = sum(1 for k in paths if k[0] == "i")
     n_vid = sum(1 for k in paths if k[0] == "v")
-    scenes, pnotes = parse_manifest(manifest, 0, 0)
-    if not (manifest or "").strip():
-        scenes, pnotes = parse_manifest("", max([k[1] for k in paths if k[0] == "i"] or [0]),
-                                        max([k[1] for k in paths if k[0] == "v"] or [0]))
+    scenes, pnotes = parse_manifest(manifest, max([k[1] for k in paths if k[0] == "i"] or [0]),
+                                    max([k[1] for k in paths if k[0] == "v"] or [0]))
     notes += pnotes
+    if scenes and scenes[0].deck_default and audio_src:      # a plain slideshow fills the audio track
+        ap = resolve_file(audio_src, input_dir, work)
+        adur = probe_duration(ap) if ap else 0.0
+        if adur:
+            ovs = (scenes[0].trans_dur or FADE_DEFAULT) if scenes[0].trans != "cut" else 0.0
+            each = max(1.2, min(10.0, (adur + ovs * (len(scenes) - 1)) / len(scenes)))
+            for c in scenes:
+                if c.hold is None:
+                    c.hold = each
     cue_report, narr_at, narr = [], None, None
     expanded = []
     for sc in scenes:

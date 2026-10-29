@@ -57,3 +57,12 @@ The voice over is transcribed with word timing (faster-whisper); each cue is mat
 occurrence of its words, in order (stem and near spellings match). The transition starts `lead` seconds
 (default 0.12) before the word. `cue at 12.5 show ...` uses a time, `until WORDS` ends the picture on a word.
 Cues that are never heard are placed after the previous one and listed in the report (`cues`).
+
+## Simplest forms
+
+- Two pictures, no manifest: a fade between them. One word picks the transition: `iris`, `wipe`, `slideup`, `cut` ...
+  (`mix` varies it every time). More pictures and clips become a slideshow; `hold 3` sets seconds per item;
+  an audio track stretches the slideshow to its length.
+- Labels with a voice over: `label i1 lighthouse label i2 storm titles on` shows each picture when its label
+  is spoken (nothing shows before the first one; `cue start show i1` opens with a picture). Labels are matched
+  in time order, so the story may mention them in any order.
