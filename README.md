@@ -7,6 +7,7 @@ Pure PIL + ffmpeg (no model). Sub-pixel box resizes, so camera moves do not jitt
 ## Manifest
 
 Scenes start with the word `scene`; `title:` and `sub:` run to the end of the scene.
+`anim NAME` picks the title entrance: `rise` (default), `pop`, `slide`, `type`, `wipe`, `zoom`, `drop`, `blur`, or `cycle` to vary scene by scene.
 
     scene grid i1 v1 i2 i3 reveal hold 2 title: My Trip sub: summer
     scene single i4 push fade 0.6 title: Close up

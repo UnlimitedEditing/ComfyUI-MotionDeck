@@ -12,7 +12,7 @@ import time
 import urllib.request
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 try:
     from . import speaker
@@ -25,6 +25,8 @@ VID_HOLD_MAX = 6.0   # default cap for a video panel's hold
 MOVE = 0.9           # seconds for a camera move between wide view and a panel
 WIDE_HOLD = 0.7
 FADE_DEFAULT = 0.5
+ANIMS = ["rise", "pop", "slide", "type", "wipe", "zoom", "drop", "blur"]
+
 STYLES = [   # bg, gutter/border, title fill, title stroke, accent
     {"bg": (14, 16, 22), "title": (245, 245, 245), "stroke": (0, 0, 0), "accent": (240, 190, 40)},
     {"bg": (238, 236, 230), "title": (20, 20, 24), "stroke": (255, 255, 255), "accent": (200, 60, 40)},
@@ -81,6 +83,7 @@ class Scene:
         self.lang = ""
         self.whisper = None
         self.caps = {}
+        self.anim = "rise"        # title entrance, see ANIMS
 
 
 def _num(tok):
@@ -146,6 +149,9 @@ def parse_manifest(text, n_images, n_videos):
                 i += 1
             elif t == "stack":
                 sc.stack = True
+            elif t == "anim" and i + 1 < len(low) and low[i + 1] in ANIMS + ["cycle"]:
+                sc.anim = low[i + 1]
+                i += 1
             elif t == "caps" and i + 1 < len(low) and low[i + 1] in ("karaoke", "single", "off"):
                 sc.caps["caps"] = low[i + 1]
                 i += 1
@@ -174,7 +180,9 @@ def parse_manifest(text, n_images, n_videos):
             sc = Scene()
             sc.media = media[k:k + 4]
             scenes.append(sc)
-    for sc in scenes:
+    for k, sc in enumerate(scenes):
+        if sc.anim == "cycle":
+            sc.anim = ANIMS[k % len(ANIMS)]
         if sc.layout is None:
             sc.layout = "card" if not sc.media else ("single" if len(sc.media) == 1 else "grid")
         if sc.layout == "single":
@@ -224,6 +232,25 @@ def _pfont(kind, size):
         return _font(size, bold=(kind != "md"))
 
 
+def _back(x):
+    x = min(1.0, max(0.0, x))
+    return 1.0 + 2.70158 * (x - 1.0) ** 3 + 1.70158 * (x - 1.0) ** 2
+
+
+def _bounce(x):
+    n, d = 7.5625, 2.75
+    if x < 1 / d:
+        return n * x * x
+    if x < 2 / d:
+        x -= 1.5 / d
+        return n * x * x + 0.75
+    if x < 2.5 / d:
+        x -= 2.25 / d
+        return n * x * x + 0.9375
+    x -= 2.625 / d
+    return n * x * x + 0.984375
+
+
 def _out(x):
     x = min(1.0, max(0.0, x))
     return 1.0 - (1.0 - x) ** 3
@@ -234,8 +261,9 @@ class TitleAnim:
     (clipped to its line box), staggered, then the whole block fades and lifts away. Cards get an
     accent rule that wipes open under the text; titles over media sit on a dark pill with an accent bar."""
 
-    def __init__(self, title, sub, W, H, style, card=False, top=False):
+    def __init__(self, title, sub, W, H, style, card=False, top=False, anim="rise"):
         self.W, self.H, self.card = W, H, card
+        self.anim = anim if anim in ANIMS else "rise"
         self.items = []     # dict(img, x, y, kind, delay)
         d = ImageDraw.Draw(Image.new("RGB", (4, 4)))
         base = H * (0.075 if card else 0.048 if top else 0.066)
@@ -287,6 +315,15 @@ class TitleAnim:
             self.items.append(dict(img=Image.new("RGBA", (rw, rule_h), sfill + (255,)), x=(W - rw) // 2, y=y,
                                    kind="rule", delay=0.08 * (k + 1)))
 
+        if self.anim == "type":    # lines are typed one after another
+            t_end = 0.0
+            for it in self.items:
+                if it["kind"] == "line":
+                    it["delay"] = t_end
+                    t_end += it["dur"] + 0.08
+                elif it["kind"] == "rule":
+                    it["delay"] = t_end
+
     @staticmethod
     def _line(d, text, font, lh, fill, W, y, k, card, size):
         pad = max(4, size // 8)
@@ -295,22 +332,68 @@ class TitleAnim:
         asc, desc = font.getmetrics()
         ImageDraw.Draw(img).text((pad, (lh - asc - desc) // 2), text, font=font, fill=fill + (255,),
                                  stroke_width=0 if card else 0)
-        return dict(img=img, x=(W - w) // 2, y=y, kind="line", delay=0.085 * k)
+        return dict(img=img, x=(W - w) // 2, y=y, kind="line", delay=0.085 * k, text=text, font=font, pad=pad,
+                    dur=max(0.35, (0.03 if size > 40 else 0.02) * len(text)))
+
+    def _line_frame(self, it, p, local):
+        """(RGBA image, dx, dy) for one text line at eased progress p (0..1) under this entrance."""
+        src = it["img"]
+        w, h = src.size
+        k = self.anim
+        if k == "rise":
+            tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            tmp.paste(src, (0, int((1.0 - p) * h * 1.05)))
+            return tmp, 0, 0
+        if k == "drop":
+            q = _bounce(min(1.0, max(0.0, (local - it["delay"]) / 0.75)))
+            return src, 0, int((q - 1.0) * h * 1.6)
+        if k == "slide":
+            sign = -1 if (int(round(it["delay"] / 0.085)) % 2) else 1
+            return src, int(sign * (1.0 - p) * self.W * 0.35), 0
+        if k in ("pop", "zoom"):
+            s0 = 0.55 if k == "pop" else 1.7
+            sc = (_back(p) if k == "pop" else p)
+            sc = s0 + (1.0 - s0) * sc
+            nw, nh = max(2, int(w * sc)), max(2, int(h * sc))
+            return src.resize((nw, nh), Image.BILINEAR), (w - nw) // 2, (h - nh) // 2
+        if k == "blur":
+            r = (1.0 - p) * 14.0
+            return (src.filter(ImageFilter.GaussianBlur(r)) if r > 0.4 else src), 0, 0
+        if k == "wipe":
+            import numpy as np
+            a = np.array(src.getchannel("A"), np.float32)
+            edge = p * (w + 60) - 30
+            ramp = np.clip((edge - np.arange(w, dtype=np.float32)) / 30.0, 0.0, 1.0)
+            out = src.copy()
+            out.putalpha(Image.fromarray((a * ramp[None, :]).astype("uint8"), "L"))
+            return out, 0, 0
+        if k == "type":
+            q = min(1.0, max(0.0, (local - it["delay"]) / it["dur"]))
+            n = int(round(q * len(it["text"])))
+            vis = it["pad"] + int(ImageDraw.Draw(Image.new("RGB", (4, 4))).textlength(it["text"][:n], font=it["font"]))
+            tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            tmp.paste(src.crop((0, 0, min(w, vis), h)), (0, 0))
+            if q < 1.0 and int(local * 6) % 2 == 0:    # blinking cursor
+                cw = max(3, h // 18)
+                ImageDraw.Draw(tmp).rectangle((min(w - cw, vis + 2), int(h * 0.18), min(w, vis + 2 + cw), int(h * 0.82)),
+                                              fill=(255, 255, 255, 255))
+            return tmp, 0, 0
+        return src, 0, 0
 
     def draw(self, img, t, t0, end, out=0.35):
         local = t - t0
         q = min(1.0, max(0.0, (t - (end - out)) / out))
         for it in self.items:
-            p = _out((local - it["delay"]) / 0.55)
+            dur_in = it.get("dur", 0.55) if (self.anim == "type" and it["kind"] == "line") else 0.55
+            p = _out((local - it["delay"]) / (0.55 if self.anim != "type" else dur_in))
             if p <= 0.0 or q >= 1.0:
                 continue
             src = it["img"]
-            a = min(1.0, p * 1.8) * (1.0 - q)
+            a = (1.0 if (self.anim == "type" and it["kind"] == "line") else min(1.0, p * 1.8)) * (1.0 - q)
             lift = -int(q * self.H * 0.012)
+            dx = dy = 0
             if it["kind"] == "line":
-                w, h = src.size
-                tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-                tmp.paste(src, (0, int((1.0 - p) * h * 1.05)))
+                tmp, dx, dy = self._line_frame(it, p if self.anim != "type" else 1.0, local)
             elif it["kind"] == "rule":
                 w, h = src.size
                 tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -319,12 +402,14 @@ class TitleAnim:
             else:
                 tmp = src.copy()
             if a < 1.0:
+                if tmp is src:
+                    tmp = tmp.copy()    # never dim the cached line image in place
                 tmp.putalpha(tmp.getchannel("A").point(lambda v, a=a: int(v * a)))
-            img.paste(tmp, (it["x"], it["y"] + lift), tmp)
+            img.paste(tmp, (it["x"] + dx, it["y"] + lift + dy), tmp)
 
 
-def text_layer(title, sub, W, H, style, card=False, top=False):
-    return TitleAnim(title, sub, W, H, style, card=card, top=top)
+def text_layer(title, sub, W, H, style, card=False, top=False, anim="rise"):
+    return TitleAnim(title, sub, W, H, style, card=card, top=top, anim=anim)
 
 
 def _gradient(W, H, bg):
@@ -470,7 +555,7 @@ class SceneRender:
         if sc.layout == "card" or n == 0:
             self.kind = "card"
             self.duration = (sc.hold or 3.0) * 1.0
-            self.layer = text_layer(sc.title, sc.sub, W, H, style, card=True)
+            self.layer = text_layer(sc.title, sc.sub, W, H, style, card=True, anim=sc.anim)
             self.bgimg = _gradient(W, H, style["bg"])
             self.panel_objs = []
             self.timeline = []
@@ -567,7 +652,7 @@ class SceneRender:
             self.kind = "single"
         self.timeline = tl
         self.duration = t
-        self.layer = text_layer(sc.title, sc.sub, W, H, style) if (sc.title or sc.sub) else None
+        self.layer = text_layer(sc.title, sc.sub, W, H, style, anim=sc.anim) if (sc.title or sc.sub) else None
         self.title_dur = min(self.duration - 0.3, max(2.0, 3.0)) if self.layer else 0.0
 
     def n_frames(self):
@@ -665,7 +750,7 @@ class SpeakerScene:
             self.ch, self.cw = float(self.sh), self.sh * asp
         else:
             self.cw, self.ch = float(self.sw), self.sw / asp
-        self.layer = text_layer(sc.title, sc.sub, W, H, style, top=True) if (sc.title or sc.sub) else None
+        self.layer = text_layer(sc.title, sc.sub, W, H, style, top=True, anim=sc.anim) if (sc.title or sc.sub) else None
         self.title_dur = min(3.0, self.duration - 0.3) if self.layer else 0.0
         self.info = {"words": len(words), "people": K, "stack": self.stack,
                      "speaker_segments": [(round(a, 2), round(b, 2), s + 1) for a, b, s in self.segs][:40],
