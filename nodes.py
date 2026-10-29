@@ -42,6 +42,8 @@ class MotionDeckCompile:
             req[f"image{i}"] = ("STRING", {"default": ""})
         req["audio_init_filename"] = ("STRING", {"default": ""})
         req["audio_init_url"] = ("STRING", {"default": ""})
+        req["video_init_filename"] = ("STRING", {"default": ""})
+        req["video_init_url"] = ("STRING", {"default": ""})
         return {"required": req}
 
     RETURN_TYPES = ("VIDEO", "STRING", "IMAGE")
@@ -52,12 +54,12 @@ class MotionDeckCompile:
     async def run(self, manifest, width, height, fps, max_frames, style, pace, audio_file,
                   video1, video2, video3, video4, video5, video6, video7, video8,
                   image1, image2, image3, image4, image5, image6, image7, image8,
-                  audio_init_filename, audio_init_url):
+                  audio_init_filename, audio_init_url, video_init_filename, video_init_url):
         # blocking PIL/ffmpeg work stays off the event loop (a blocked loop can make a finished job report timed_out)
         return await asyncio.to_thread(
             self._run_sync, manifest, width, height, fps, max_frames, style, pace,
             audio_file or audio_init_filename or audio_init_url,
-            [video1, video2, video3, video4, video5, video6, video7, video8],
+            [video1 or video_init_filename or video_init_url, video2, video3, video4, video5, video6, video7, video8],
             [image1, image2, image3, image4, image5, image6, image7, image8])
 
     def _run_sync(self, manifest, width, height, fps, max_frames, style, pace, audio_src, vids, imgs):
