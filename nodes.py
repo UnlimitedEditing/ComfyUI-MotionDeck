@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import os
 import tempfile
 
@@ -56,13 +57,26 @@ class MotionDeckCompile:
                   image1, image2, image3, image4, image5, image6, image7, image8,
                   audio_init_filename, audio_init_url, video_init_filename, video_init_url):
         # blocking PIL/ffmpeg work stays off the event loop (a blocked loop can make a finished job report timed_out)
+        seen = {"audio_file": audio_file, "audio_init_filename": audio_init_filename, "audio_init_url": audio_init_url,
+                "video_init_filename": video_init_filename, "video_init_url": video_init_url, "video1": video1}
         return await asyncio.to_thread(
             self._run_sync, manifest, width, height, fps, max_frames, style, pace,
             audio_file or audio_init_filename or audio_init_url,
             [video1 or video_init_filename or video_init_url, video2, video3, video4, video5, video6, video7, video8],
-            [image1, image2, image3, image4, image5, image6, image7, image8])
+            [image1, image2, image3, image4, image5, image6, image7, image8], seen)
 
-    def _run_sync(self, manifest, width, height, fps, max_frames, style, pace, audio_src, vids, imgs):
+    @staticmethod
+    def _seen(seen):
+        """Which media fields arrived (names + a short, token-free preview) - the report shows this so a
+        silently dropped field is visible."""
+        out = {}
+        for k, v in seen.items():
+            if v:
+                v = re.sub(r"(/bot)[^/]+", r"\1***", str(v))
+                out[k] = v[:70]
+        return out
+
+    def _run_sync(self, manifest, width, height, fps, max_frames, style, pace, audio_src, vids, imgs, seen):
         from comfy_api.latest import InputImpl
         try:
             import folder_paths
@@ -73,6 +87,7 @@ class MotionDeckCompile:
         out = os.path.join(work, "deck.mp4")
         report = core.compile_deck(manifest, vids, imgs, audio_src, out, work, input_dir, width=width,
                                    height=height, fps=fps, max_frames=max_frames, style_id=style, pace=pace)
+        report["fields_received"] = self._seen(seen)
         text = json.dumps(report, indent=1)
         return (InputImpl.VideoFromFile(out), text, _encode_string_as_image(text))
 
