@@ -39,3 +39,21 @@ Options: `start N`, `hold N`, `stack` (both speakers, one above the other), `fix
 Clean-room implementation: no code from ClipsKitty (AGPL-3.0). Fonts Anton, Bebas Neue and Poppins are SIL OFL.
 Model files expected under `models/`: `whisper/large-v3/*` and `yunet/face_detection_yunet_2023mar.onnx` (both are
 also fetched at run time if missing).
+
+
+## Transitions, reel shorthand, voice-over cues
+
+Transitions (after a scene's options, optional seconds): `fade` `cut` `slide` `slideup` `slidedown` `wipe`
+`dip` `flash` `iris` `zoomthru` `blurfade`.
+
+Reel: one slide per media item. `scene reel i1 3 push i2 2.5 drift slideup 0.6 v1 6 cut title: My trip`
+(a bare number is seconds, then camera / transition [seconds] / `anim NAME`).
+
+Voice over: give an audio track (`audio_file` or the init audio) and cue pictures to spoken words.
+
+    scene voiceover cue start show i1 title: My story cue lighthouse show i2 iris 0.5 cue storm show i3 zoomthru until calm
+
+The voice over is transcribed with word timing (faster-whisper); each cue is matched to the next spoken
+occurrence of its words, in order (stem and near spellings match). The transition starts `lead` seconds
+(default 0.12) before the word. `cue at 12.5 show ...` uses a time, `until WORDS` ends the picture on a word.
+Cues that are never heard are placed after the previous one and listed in the report (`cues`).
