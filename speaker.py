@@ -282,7 +282,7 @@ class Captions:
     def __init__(self, words, W, H, opts):
         self.W, self.H = W, H
         self.style = opts.get("caps", "karaoke")
-        self.font = opts.get("font", 0)
+        self.font = opts.get("font", 3)
         self.size = max(16, int(H * float(opts.get("size", 5.0)) / 100.0))
         self.fg = COLORS.get(opts.get("fg", "white"), (255, 255, 255))
         self.hl = COLORS.get(opts.get("hl", "yellow"), (255, 221, 0))

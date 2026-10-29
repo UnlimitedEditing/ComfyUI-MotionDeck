@@ -213,37 +213,128 @@ def _wrap(draw, text, font, max_w):
     return lines
 
 
-def text_layer(title, sub, W, H, style, card=False, top=False):
-    """RGBA full-frame layer with the title (and subtitle), centred (card) or lower-third (over media)."""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    tsize = max(24, int(H * (0.11 if card else 0.075)))
-    ssize = max(16, int(tsize * 0.45))
-    longest = max((d.textlength(w, font=_font(tsize)) for w in (title or "x").split()), default=0)
-    if longest > W * 0.84:    # a single long word must still fit the frame width
-        tsize = max(20, int(tsize * W * 0.84 / longest))
-        ssize = max(16, int(tsize * 0.45))
-    tf, sf = _font(tsize), _font(ssize, bold=False)
-    tl = _wrap(d, title, tf, int(W * 0.84)) if title else []
-    sl = _wrap(d, sub, sf, int(W * 0.8)) if sub else []
-    th = int(tsize * 1.2) * len(tl) + (int(ssize * 1.4) * len(sl) + int(ssize * 0.6) if sl else 0)
-    y = (H - th) // 2 if card else (int(H * 0.09) if top else int(H * 0.82) - th)
-    if not card and tl:    # soft band behind the text so it reads over any picture
-        band = Image.new("RGBA", (W, th + int(tsize * 0.8)), (0, 0, 0, 120))
-        layer.alpha_composite(band, (0, max(0, y - int(tsize * 0.4))))
-        d = ImageDraw.Draw(layer)
-    stroke = max(2, tsize // 14)
-    fill, sk = style["title"], style["stroke"]
-    for ln in tl:
-        d.text(((W - d.textlength(ln, font=tf)) / 2, y), ln, font=tf, fill=fill, stroke_width=stroke, stroke_fill=sk)
-        y += int(tsize * 1.2)
-    if sl:
-        y += int(ssize * 0.6)
+_PFONTS = {"xb": "Poppins-ExtraBold.ttf", "sb": "Poppins-SemiBold.ttf", "md": "Poppins-Medium.ttf"}
+
+
+def _pfont(kind, size):
+    p = os.path.join(os.path.dirname(__file__), "fonts", _PFONTS[kind])
+    try:
+        return ImageFont.truetype(p, size)
+    except Exception:
+        return _font(size, bold=(kind != "md"))
+
+
+def _out(x):
+    x = min(1.0, max(0.0, x))
+    return 1.0 - (1.0 - x) ** 3
+
+
+class TitleAnim:
+    """Title + subtitle that animate line by line: each line slides up from behind its own baseline
+    (clipped to its line box), staggered, then the whole block fades and lifts away. Cards get an
+    accent rule that wipes open under the text; titles over media sit on a dark pill with an accent bar."""
+
+    def __init__(self, title, sub, W, H, style, card=False, top=False):
+        self.W, self.H, self.card = W, H, card
+        self.items = []     # dict(img, x, y, kind, delay)
+        d = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+        base = H * (0.075 if card else 0.048 if top else 0.066)
+        tsize = max(22, int(base if not card else H * 0.085))
+        longest = max((d.textlength(w, font=_pfont("xb", tsize)) for w in (title or "x").split()), default=0)
+        maxw = int(W * (0.84 if card else 0.78))
+        if longest > maxw:
+            tsize = max(20, int(tsize * maxw / longest))
+        ssize = max(16, int(tsize * 0.5))
+        tf, sf = _pfont("xb", tsize), _pfont("md", ssize)
+        tl = _wrap(d, title, tf, maxw) if title else []
+        sl = _wrap(d, sub, sf, maxw) if sub else []
+        fill = style["title"] if card else (250, 250, 250)
+        sfill = style["accent"]
+        tlh = int(tsize * 1.28)
+        slh = int(ssize * 1.5)
+        gap = int(ssize * 0.55) if (tl and sl) else 0
+        rule_h = max(4, tsize // 11) if (card and tl) else 0
+        rule_gap = int(tsize * 0.35) if rule_h else 0
+        block_h = tlh * len(tl) + (gap + slh * len(sl) if sl else 0) + (rule_gap + rule_h if rule_h else 0)
+        widths = [d.textlength(ln, font=tf) for ln in tl] + [d.textlength(ln, font=sf) for ln in sl]
+        block_w = int(max(widths)) if widths else 0
+        if card:
+            y = (H - block_h) // 2
+        else:
+            pad = int(tsize * 0.55)
+            bottom = int(H * (0.93 if top else 0.88))
+            y = bottom - block_h - pad
+            px0, py0 = (W - block_w) // 2 - pad, y - pad
+            pill = Image.new("RGBA", (block_w + 2 * pad, block_h + 2 * pad), (0, 0, 0, 0))
+            pd = ImageDraw.Draw(pill)
+            pd.rounded_rectangle((0, 0, pill.width - 1, pill.height - 1), radius=int(pad * 0.9), fill=(10, 10, 14, 175))
+            bar = max(4, tsize // 10)
+            pd.rounded_rectangle((pad // 2, pad // 2, pad // 2 + bar, pill.height - pad // 2 - 1), radius=bar // 2, fill=sfill + (255,))
+            self.items.append(dict(img=pill, x=px0, y=py0, kind="fade", delay=0.0))
+        k = 0
+        for ln in tl:
+            self.items.append(self._line(d, ln, tf, tlh, fill, W, y, k, card, tsize))
+            y += tlh
+            k += 1
+        y += gap
         for ln in sl:
-            d.text(((W - d.textlength(ln, font=sf)) / 2, y), ln, font=sf, fill=style["accent"],
-                   stroke_width=max(1, ssize // 14), stroke_fill=sk)
-            y += int(ssize * 1.4)
-    return layer
+            self.items.append(self._line(d, ln, sf, slh, sfill, W, y, k + 1, card, ssize))
+            y += slh
+            k += 1
+        if rule_h:
+            y += rule_gap
+            rw = int(min(W * 0.5, max(block_w * 0.45, W * 0.12)))
+            self.items.append(dict(img=Image.new("RGBA", (rw, rule_h), sfill + (255,)), x=(W - rw) // 2, y=y,
+                                   kind="rule", delay=0.08 * (k + 1)))
+
+    @staticmethod
+    def _line(d, text, font, lh, fill, W, y, k, card, size):
+        pad = max(4, size // 8)
+        w = int(d.textlength(text, font=font)) + 2 * pad
+        img = Image.new("RGBA", (w, lh), (0, 0, 0, 0))
+        asc, desc = font.getmetrics()
+        ImageDraw.Draw(img).text((pad, (lh - asc - desc) // 2), text, font=font, fill=fill + (255,),
+                                 stroke_width=0 if card else 0)
+        return dict(img=img, x=(W - w) // 2, y=y, kind="line", delay=0.085 * k)
+
+    def draw(self, img, t, t0, end, out=0.35):
+        local = t - t0
+        q = min(1.0, max(0.0, (t - (end - out)) / out))
+        for it in self.items:
+            p = _out((local - it["delay"]) / 0.55)
+            if p <= 0.0 or q >= 1.0:
+                continue
+            src = it["img"]
+            a = min(1.0, p * 1.8) * (1.0 - q)
+            lift = -int(q * self.H * 0.012)
+            if it["kind"] == "line":
+                w, h = src.size
+                tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                tmp.paste(src, (0, int((1.0 - p) * h * 1.05)))
+            elif it["kind"] == "rule":
+                w, h = src.size
+                tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                ww = max(1, int(w * p))
+                tmp.paste(src.crop((0, 0, ww, h)), ((w - ww) // 2, 0))
+            else:
+                tmp = src.copy()
+            if a < 1.0:
+                tmp.putalpha(tmp.getchannel("A").point(lambda v, a=a: int(v * a)))
+            img.paste(tmp, (it["x"], it["y"] + lift), tmp)
+
+
+def text_layer(title, sub, W, H, style, card=False, top=False):
+    return TitleAnim(title, sub, W, H, style, card=card, top=top)
+
+
+def _gradient(W, H, bg):
+    import numpy as np
+    lum = sum(bg) / 3.0
+    d = 14 if lum < 128 else -10
+    top = np.array(bg, np.float32)
+    bot = np.clip(top + d, 0, 255)
+    col = (top[None, :] * (1 - np.linspace(0, 1, H)[:, None]) + bot[None, :] * np.linspace(0, 1, H)[:, None])
+    return Image.fromarray(np.repeat(col[:, None, :], W, axis=1).astype("uint8"), "RGB")
 
 
 # ── media ─────────────────────────────────────────────────────────────────────
@@ -380,6 +471,7 @@ class SceneRender:
             self.kind = "card"
             self.duration = (sc.hold or 3.0) * 1.0
             self.layer = text_layer(sc.title, sc.sub, W, H, style, card=True)
+            self.bgimg = _gradient(W, H, style["bg"])
             self.panel_objs = []
             self.timeline = []
             self.canvas = None
@@ -490,7 +582,7 @@ class SceneRender:
     def frame(self, k):
         t = k / self.fps
         if self.kind == "card":
-            img = Image.new("RGB", (self.W, self.H), self.style["bg"])
+            img = self.bgimg.copy()
             self._title(img, t, self.duration)
             return img
         for po, rect in zip(self.panel_objs, self.rects):
@@ -507,18 +599,11 @@ class SceneRender:
     def _title(self, img, t, dur):
         if self.layer is None:
             return
-        t0, fin, fout = 0.3, 0.45, 0.35
+        t0 = 0.3
         end = min(dur, t0 + (self.title_dur if self.kind != "card" else self.duration - 0.6))
         if t < t0 or t > end:
             return
-        a = min(1.0, (t - t0) / fin) * min(1.0, (end - t) / fout)
-        a = max(0.0, a)
-        rise = int((1.0 - _ease((t - t0) / fin)) * self.H * 0.03)
-        layer = self.layer
-        if a < 1.0:
-            layer = layer.copy()
-            layer.putalpha(layer.getchannel("A").point(lambda v: int(v * a)))
-        img.paste(layer, (0, rise), layer)
+        self.layer.draw(img, t, t0, end)
 
     def close(self):
         for po in self.panel_objs:
