@@ -246,7 +246,8 @@ def _parse_reel(head, title, sub, notes):
 
 
 def _norm_word(w):
-    return re.sub(r"[^a-z0-9']", "", (w or "").lower())
+    w = re.sub(r"[^a-z0-9']", "", (w or "").lower())
+    return w[:-2] if w.endswith("'s") else w.replace("'", "")
 
 
 def _same_word(a, b):
@@ -304,7 +305,8 @@ def expand_voiceover(sc, audio_src, input_dir, work, fps, notes):
             j = _find_phrase(words, c.cue_words, pos)
             if j is None:
                 t = prev + max(1.0, (dur - prev) / max(1, len(cues) - n))
-                notes.append(f"cue '{label}' not heard in the voice over: placed at {t:.1f}s")
+                heard = " ".join(w["word"] for w in words)[:260]
+                notes.append(f"cue '{label}' not heard in the voice over: placed at {t:.1f}s (heard: {heard})")
                 how = "not heard"
             else:
                 t = float(words[j]["start"])
