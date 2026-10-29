@@ -219,6 +219,10 @@ def text_layer(title, sub, W, H, style, card=False, top=False):
     d = ImageDraw.Draw(layer)
     tsize = max(24, int(H * (0.11 if card else 0.075)))
     ssize = max(16, int(tsize * 0.45))
+    longest = max((d.textlength(w, font=_font(tsize)) for w in (title or "x").split()), default=0)
+    if longest > W * 0.84:    # a single long word must still fit the frame width
+        tsize = max(20, int(tsize * W * 0.84 / longest))
+        ssize = max(16, int(tsize * 0.45))
     tf, sf = _font(tsize), _font(ssize, bold=False)
     tl = _wrap(d, title, tf, int(W * 0.84)) if title else []
     sl = _wrap(d, sub, sf, int(W * 0.8)) if sub else []
